@@ -539,7 +539,8 @@ class Archiver:
         # create tar, encrypt, and split into chunks
         os.system('mkdir {}'.format(cache))
         prefix = '{}/archive-'.format(cache)
-        cmd = ('tar --exclude-tag=NOBACKUP -c {} '
+        cmd = ('set -o pipefail;'
+               'tar --exclude-tag=NOBACKUP -c {} '
                '| gpg -e -r {} '
                '| split -a3 -b{} - {}'
         ).format(shlex.quote(directory), shlex.quote(self.gpg_key),
