@@ -22,7 +22,7 @@ Backup home data to Amazon's Glacier.
 * Keeps a database of uploaded archives and only uploads new archives after a minimum amount of time has elapsed.
 
 ## Caution
-I hope you find `glacier-backup` useful, but use at your own risk.  If you encounter errors, your feedback would be appreciated.
+This tool has not been extensively tested.  I hope you find `glacier-backup` useful, but use at your own risk.  If you encounter errors, your feedback is appreciated.
 
 ## Requirements
 * Amazon's [AWS command-line interface](https://aws.amazon.com/cli/) set up with a defined profile.
