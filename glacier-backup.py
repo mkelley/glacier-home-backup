@@ -10,6 +10,8 @@ config = Config()
 config.backup_cache = '/var/backup/glacier-cache/'
 config.backupdb = config.backup_cache + 'backup.db'
 config.min_age = 90  # days
+# tar_options is a list of options, or an empty list
+config.tar_options = ['-p', '--ignore-failed-read', '--exclude-tag=NOBACKUP']
 config.gpg_key = 'Mike and Martha Backup Archive'
 config.vault_name = 'home-backup'
 config.aws_profile = 'corc'  # aws cli profile name
@@ -395,6 +397,8 @@ class Archiver:
       The backup database.
     backup_cache : string, optional
       The backup cache location.
+    tar_options : list, optional
+      A list of options to include in the tar command.
     gpg_key : string, optional
       The name of the GPG key to use to encrypt the archive.
     min_age : int, optional
@@ -407,13 +411,15 @@ class Archiver:
     """
     
     def __init__(self, chunk_size, log, backupdb,
-                 backup_cache=config.backup_cache, gpg_key=config.gpg_key,
+                 backup_cache=config.backup_cache,
+                 tar_options=config.tar_options, gpg_key=config.gpg_key,
                  min_age=config.min_age, aws_profile=config.aws_profile,
                  vault_name=config.vault_name, debug=False):
         assert isinstance(chunk_size, int)
         assert isinstance(log, Logger)
         assert isinstance(backupdb, BackupDB)
         assert isinstance(backup_cache, str)
+        assert isinstance(tar_options, list)
         assert isinstance(gpg_key, str)
         assert isinstance(aws_profile, str)
         assert isinstance(vault_name, str)
@@ -423,6 +429,7 @@ class Archiver:
         self.log = log
         self.backupdb = backupdb
         self.backup_cache = backup_cache
+        self.tar_options = tar_options
         self.gpg_key = gpg_key
         self.min_age = min_age
         self.aws_profile = aws_profile
@@ -520,6 +527,7 @@ class Archiver:
         import shlex
         import tarfile
         import subprocess
+        from subprocess import Popen, PIPE
         from datetime import datetime    
 
         head, tail = os.path.split(directory)
@@ -539,21 +547,40 @@ class Archiver:
         # create tar, encrypt, and split into chunks
         os.system('mkdir {}'.format(cache))
         prefix = '{}/archive-'.format(cache)
-        cmd = ('set -o pipefail;'
-               'tar --exclude-tag=NOBACKUP -c {} '
-               '| gpg -e -r {} '
-               '| split -a3 -b{} - {}'
-        ).format(shlex.quote(directory), shlex.quote(self.gpg_key),
-                 self.chunk_size, prefix)
-        self.log('Archiver: ' + cmd)
-        status, output = subprocess.getstatusoutput(cmd)
+
+        cmd = ['tar'] + self.tar_options + ['-c', directory]
+        self.log('Archiver: ' + ' '.join(cmd))
+        tar = Popen(cmd, stdout=PIPE, stderr=PIPE)
+
+        cmd = ['gpg', '-e', '-r', self.gpg_key]
+        self.log('Archiver: ' + ' '.join(cmd))
+        gpg = Popen(cmd, stdin=tar.stdout, stdout=PIPE, stderr=PIPE)
+
+        cmd = ['split', '-a3', '-b{}'.format(self.chunk_size), '-', prefix]
+        self.log('Archiver: ' + ' '.join(cmd))
+        split = Popen(cmd, stdin=gpg.stdout, stderr=PIPE)
+
+        output = []
+        for prog in (tar, gpg, split):
+            r = prog.communicate()
+            if r[1] is not None:
+                output.append(r[1].decode())
+
+        status = 0
+        for prog in (tar, gpg, split):
+            status += prog.returncode
+
+        self.log('Archiver:')
         if status != 0:
-            raise TarGPGSplitError('Error creating archive with tar/gpg/split.')
-        self.log('Archiver:' + output)
+            output.insert(0, 'Error creating archive with tar/gpg/split.')
+            raise TarGPGSplitError('\n'.join(output))
+
         self.log('Archiver:')
         self.log(subprocess.check_output(['ls', '-l', cache]).decode())
 
-        ls = subprocess.check_output('ls {}???'.format(prefix), shell=True)
+        status, ls = subprocess.getstatusoutput('ls {}???'.format(prefix))
+        if status != 0:
+            raise TarGPGSplitError('No archive created.  Verify directory and read permissions.')
         chunks = ls.decode().split()
         self.log("Archiver: {} chunks".format(len(chunks)))
         return chunks, description, now
