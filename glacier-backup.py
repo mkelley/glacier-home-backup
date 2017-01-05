@@ -412,6 +412,8 @@ class Archiver:
       archive will not be created.
     debug : bool, optional
       Do everything but interact with Glacier.
+    cleanup : bool, optional
+      After uploading archive, clean up the cache directory.
     
     """
     
@@ -419,7 +421,7 @@ class Archiver:
                  backup_cache=config.backup_cache,
                  tar_options=config.tar_options, gpg_key=config.gpg_key,
                  min_age=config.min_age, aws_profile=config.aws_profile,
-                 vault_name=config.vault_name, debug=False):
+                 vault_name=config.vault_name, debug=False, cleanup=True):
         assert isinstance(chunk_size, int)
         assert isinstance(log, Logger)
         assert isinstance(backupdb, BackupDB)
@@ -429,6 +431,8 @@ class Archiver:
         assert isinstance(aws_profile, str)
         assert isinstance(vault_name, str)
         assert isinstance(min_age, int)
+        assert isinstance(debug, bool)
+        assert isinstance(cleanup, bool)
         
         self.chunk_size = chunk_size
         self.log = log
@@ -440,6 +444,7 @@ class Archiver:
         self.aws_profile = aws_profile
         self.vault_name = vault_name
         self.debug = debug
+        self.cleanup = cleanup
 
         if self.debug:
             self.log("Archiver: Debug mode.")
@@ -503,7 +508,9 @@ class Archiver:
         if not self.debug:
             self.backupdb.update('last backup', directory, date)
             self.backupdb.update('glacier metadata', directory, metadata)
-        self._clean_cache(directory, chunks)
+
+        if self.cleanup:
+            self._clean_cache(directory, chunks)
 
     def _archive(self, directory):
         """Create an encrypted archive of a directory, split into chunks.
@@ -565,15 +572,11 @@ class Archiver:
         self.log('Archiver: ' + ' '.join(cmd))
         split = Popen(cmd, stdin=gpg.stdout, stderr=PIPE)
 
+        status = 0
         output = []
         for prog in (tar, gpg, split):
-            r = prog.communicate()
-            if r[1] is not None:
-                output.append(r[1].decode())
-
-        status = 0
-        for prog in (tar, gpg, split):
-            status += prog.returncode
+            status = prog.wait()
+            output.append(prog.stderr.read(-1))
 
         self.log('Archiver:')
         if status != 0:
@@ -596,6 +599,7 @@ parser.add_argument('-b', default=128, type=int, help='Chunk size for archive up
 parser.add_argument('--db', action='store_true', help='Show the database contents.')
 parser.add_argument('--log', action='store_true', help='Show the backup log.')
 parser.add_argument('--debug', action='store_true', help='Do not send anything to AWS, no backup database updates.')
+parser.add_argument('--no-cleanup', dest='cleanup', action='store_false', help='Do not clean up the cache location.  Useful with --debug for verifying archive creation.')
 parser.add_argument('--checksum', action='store_true', help='Print the SHA256 tree checksum of the given file.')
 
 args = parser.parse_args()
@@ -620,7 +624,8 @@ if args.checksum:
 
 log = Logger()
 backupdb = BackupDB(log)
-archiver = Archiver(args.b * 1024**2, log, backupdb, debug=args.debug)
+archiver = Archiver(args.b * 1024**2, log, backupdb, debug=args.debug,
+                    cleanup=args.cleanup)
 
 try:
     archiver.backup(args.directory_or_file)
