@@ -581,7 +581,7 @@ class Archiver:
         status, ls = subprocess.getstatusoutput('ls {}???'.format(prefix))
         if status != 0:
             raise TarGPGSplitError('No archive created.  Verify directory and read permissions.')
-        chunks = ls.decode().split()
+        chunks = ls.split()
         self.log("Archiver: {} chunks".format(len(chunks)))
         return chunks, description, now
 
