@@ -304,6 +304,8 @@ class Glacier:
 
         """
 
+        import shlex
+        
         assert isinstance(chunks, list)
         assert all([isinstance(chunk, str) for chunk in chunks])
         assert isinstance(chunk_size, int)
@@ -314,8 +316,11 @@ class Glacier:
             metadata = self._upload_multipart_archive(chunks, chunk_size, description)
         else:
             cs = self.checksum(chunks)[0]
-            cmd = 'upload-archive --body {} --checksum {}'.format(
-                chunks[0], cs)
+            cmd = ('upload-archive'
+                   ' --archive-description {}'
+                   ' --body {}'
+                   ' --checksum {}'
+            ).format(shlex.quote(description), chunks[0], cs)
             metadata = self.send(cmd)
 
         return metadata
