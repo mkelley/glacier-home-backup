@@ -13,7 +13,8 @@ config.min_age = 90  # days
 # tar_options is a list of options, or an empty list
 config.tar_options = ['-p', '--ignore-failed-read', '--exclude-tag=NOBACKUP']
 config.gpg_key = 'Mike and Martha Backup Archive'
-config.vault_name = 'home-backup'
+#config.vault_name = 'home-backup'
+config.vault_name = 'examplevault'
 config.aws_profile = 'corc'  # aws cli profile name
 
 class CacheLocationExists(Exception):
@@ -208,7 +209,7 @@ class Glacier:
         import json
         import subprocess
 
-        _cmd = 'aws --profile {} glacier {} --account-id - --vault-name {} --output json'.format(self.aws_profile, cmd, self.vault_name)
+        _cmd = 'aws --profile={} glacier {} --account-id=- --vault-name={} --output=json'.format(self.aws_profile, cmd, self.vault_name)
         self.log('Glacier: ' + _cmd)
         
         if self.debug:
@@ -317,9 +318,9 @@ class Glacier:
         else:
             cs = self.checksum(chunks)[0]
             cmd = ('upload-archive'
-                   ' --archive-description {}'
-                   ' --body {}'
-                   ' --checksum {}'
+                   ' --archive-description={}'
+                   ' --body={}'
+                   ' --checksum={}'
             ).format(shlex.quote(description), chunks[0], cs)
             metadata = self.send(cmd)
 
@@ -333,8 +334,8 @@ class Glacier:
         # initiate upload
         cmd = (
             'initiate-multipart-upload'
-            ' --archive-description {}'
-            ' --part-size {}'
+            ' --archive-description={}'
+            ' --part-size={}'
         ).format(shlex.quote(description), chunk_size)
         multipart = self.send(cmd)
 
@@ -349,19 +350,19 @@ class Glacier:
             final_byte = min(next_byte + chunk_size - 1, file_size - 1)
             cmd = (
                 'upload-multipart-part'
-                ' --upload-id {}'
-                ' --body {}'
-                ' --range "bytes {}-{}/*"'
-                ' --checksum {}'
-            ).format(multipart['uploadId'], chunks[i],
+                ' --upload-id={}'
+                ' --body={}'
+                ' --range="bytes {}-{}/*"'
+                ' --checksum={}'
+            ).format(shlex.quote(multipart['uploadId']), chunks[i],
                      next_byte, final_byte, chunk_hashes[i])
 
             try:
                 self.send(cmd)
             except:
                 # something went wrong, abort the upload
-                cmd = 'abort-multipart-upload --upload-id {}'.format(
-                    multipart['uploadId'])
+                cmd = 'abort-multipart-upload --upload-id={}'.format(
+                    shlex.quote(multipart['uploadId']))
                 self.send(cmd)
                 raise
 
@@ -369,10 +370,10 @@ class Glacier:
             
         cmd = (
             'complete-multipart-upload'
-            ' --upload-id {}'
-            ' --checksum {}'
-            ' --archive-size {}'
-        ).format(multipart['uploadId'], file_hash, file_size)
+            ' --upload-id={}'
+            ' --checksum={}'
+            ' --archive-size={}'
+        ).format(shlex.quote(multipart['uploadId']), file_hash, file_size)
 
         return self.send(cmd)
 
@@ -386,7 +387,7 @@ class Glacier:
 
         """
 
-        cmd = 'delete-archive --archive-id {}'.format(archiveId)
+        cmd = 'delete-archive --archive-id={}'.format(archiveId)
         self.send(cmd)
 
 class Archiver:
