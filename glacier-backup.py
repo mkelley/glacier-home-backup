@@ -13,8 +13,7 @@ config.min_age = 90  # days
 # tar_options is a list of options, or an empty list
 config.tar_options = ['-p', '--ignore-failed-read', '--exclude-tag=NOBACKUP']
 config.gpg_key = 'Mike and Martha Backup Archive'
-#config.vault_name = 'home-backup'
-config.vault_name = 'examplevault'
+config.vault_name = 'home-backup'
 config.aws_profile = 'corc'  # aws cli profile name
 
 class CacheLocationExists(Exception):
@@ -27,6 +26,9 @@ class TarGPGSplitError(Exception):
     pass
 
 class AWSCLIError(Exception):
+    pass
+
+class AWSCLITimeoutError(Exception):
     pass
 
 class Logger:
@@ -215,9 +217,19 @@ class Glacier:
         if self.debug:
             return {'uploadId': '12345'}
 
-        status, output = subprocess.getstatusoutput(_cmd)
-        if status != 0:
-            raise AWSCLIError('AWS CLI error: ' + output)
+        n = 0
+        while n < 10:
+            status, output = subprocess.getstatusoutput(_cmd)
+            if status == 0:
+                break
+            else:
+                if 'RequestTimeoutException' in output:
+                    self.log('Glacier: AWS timeout, repeat command.')
+                    continue
+                else:
+                    raise AWSCLIError(output)
+        else:
+            raise AWSCLITimeoutError(output + '\nToo many timeouts: {}'.format(n))
 
         if len(output) > 0:
             return json.loads(output)
@@ -485,7 +497,7 @@ class Archiver:
         if dt is None:
             self.log('Archiver: Directory not in backup database.')
         elif dt <= self.min_age:
-            raise BackupTooYoung("Backup too young: age = {} days".format(dt))
+            raise BackupTooYoung("Age = {} days".format(dt))
 
         if dt is not None:
             # remember the last archiveId so that we can remove it after upload
@@ -551,7 +563,7 @@ class Archiver:
 
         # check that path is clean
         if os.path.exists(cache):
-            raise CacheLocationExists("Cache location exists, remove before executing: {}".format(cache))
+            raise CacheLocationExists("Remove before executing: {}".format(cache))
 
         now = datetime.now()
         description = "directory:{} date:{}".format(directory, now.isoformat())
