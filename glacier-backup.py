@@ -2,19 +2,97 @@
 import os
 import sys
 import argparse
+import configparser
 
 class Config:
-    pass
+    defaults = {
+        'cache_dir': '/var/backup/glacier-cache/',
+        'min_age': 90,
+        'tar_options': '-p --ignore-failed-read --exclude-tag=NOBACKUP',
+        'gpg_key_name': 'recipient',
+        'vault_name': 'vault',
+        'aws_profile': 'default'
+    }
+    descriptions = {
+        'cache_dir': 'Cache directory',
+        'min_age': 'Minimum archive age in days',
+        'tar_options': 'tar command options',
+        'gpg_key_name': 'GPG key name (gpg -r parameter)',
+        'vault_name': 'Glacier vault name',
+        'aws_profile': 'AWS CLI profile name'
+    }
+
+    def __init__(self):
+        self.config_file = os.path.join(os.path.expanduser("~"),
+                                        '.config', 'glacier-backup',
+                                        'config.ini')
+        self._config = {}
+        for k, v in self.defaults.items():
+            self[k] = v
+
+        if not os.path.exists(self.config_file):
+            sys.stderr.write('Configuration file not found.  Generating default file: {}\n'.format(self.config_file))
+
+            path = os.path.dirname(self.config_file)
+            d = path.split(os.path.sep)
+            for i in range(len(d)):
+                x = os.path.sep.join(d[:i+1])
+                if len(x) == 0:
+                    continue
+                if not os.path.exists(x):
+                    os.mkdir(x)
+
+            self.save()
+        else:
+            self.load()
+
+    def __setitem__(self, k, v):
+        if k not in self.defaults.keys():
+            raise KeyError('Invalid config key name: {}'.format(k))
+        if k == 'tar_options':
+            if isinstance(v, list):
+                assert all([isinstance(s, str) for s in v]), 'Each tar_options item must be a string.'
+                self._config[k] = v
+            elif isinstance(v, str):
+                self._config[k] = v.split()
+            else:
+                raise ValueError('tar_options must be a string or list of strings.')
+        elif k == 'min_age':
+            self._config[k] = int(v)
+        else:
+            assert isinstance(v, str)
+            self._config[k] = v
+
+    def __getitem__(self, k):
+        if k == 'backupdb':
+            return os.path.join(self._config['cache_dir'], 'backup.db')
+        else:
+            return self._config[k]
+
+    def _prompt(self, request, default):
+        print('{} [{}]: '.format(request, default), end=' ')
+        answer = sys.readline().strip()
+        answer = default if len(answer) == 0 else answer
+        return answer
+
+    def configure(self):
+        for k, v in self._config.items():
+            self[k] = self._prompt(self.descriptions[k], v)
+
+    def save(self):
+        c = configparser.ConfigParser()
+        c['default'] = dict(self._config,
+                            tar_options=' '.join(self['tar_options']))
+        with open(self.config_file, 'w') as outf:
+            c.write(outf)
+
+    def load(self):
+        c = configparser.ConfigParser()
+        c.read(self.config_file)
+        for k in self._config.keys():
+            self[k] = c['default'][k]
 
 config = Config()
-config.backup_cache = '/var/backup/glacier-cache/'
-config.backupdb = config.backup_cache + 'backup.db'
-config.min_age = 90  # days
-# tar_options is a list of options, or an empty list
-config.tar_options = ['-p', '--ignore-failed-read', '--exclude-tag=NOBACKUP']
-config.gpg_key = 'Mike and Martha Backup Archive'
-config.vault_name = 'home-backup'
-config.aws_profile = 'corc'  # aws cli profile name
 
 class CacheLocationExists(Exception):
     pass
@@ -28,23 +106,20 @@ class TarGPGSplitError(Exception):
 class AWSCLIError(Exception):
     pass
 
-class AWSCLITimeoutError(Exception):
-    pass
-
 class Logger:
     """Activity and error logger.
 
     Parameters
     ----------
-    backup_cache : string, optional
+    cache_dir : string, optional
       The name of the directory in which to write the log.
 
     """
     
-    def __init__(self, backup_cache=config.backup_cache):
+    def __init__(self, cache_dir=config['cache_dir']):
         import logging
-        assert isinstance(backup_cache, str)
-        self.filename = '{}/backup.log'.format(backup_cache)
+        assert isinstance(cache_dir, str)
+        self.filename = '{}/backup.log'.format(cache_dir)
         logging.basicConfig(filename=self.filename, format='%(message)s',
                             level=logging.INFO)
 
@@ -78,7 +153,7 @@ class BackupDB:
 
     backup_parameters = ('last backup', 'glacier metadata')
     
-    def __init__(self, log=None, backupdb=config.backupdb):
+    def __init__(self, log=None, backupdb=config['backupdb']):
         assert isinstance(log, (Logger, type(None)))
         assert isinstance(backupdb, str)
         self._log = log
@@ -167,8 +242,8 @@ class Glacier:
 
     """
 
-    def __init__(self, log=None, aws_profile=config.aws_profile,
-                 vault_name=config.vault_name, debug=False):
+    def __init__(self, log=None, aws_profile=config['aws_profile'],
+                 vault_name=config['vault_name'], debug=False):
         assert isinstance(log, (Logger, type(None)))
         assert isinstance(aws_profile, str)
         assert isinstance(vault_name, str)
@@ -211,25 +286,15 @@ class Glacier:
         import json
         import subprocess
 
-        _cmd = 'aws --profile={} glacier {} --account-id=- --vault-name={} --output=json'.format(self.aws_profile, cmd, self.vault_name)
+        _cmd = 'aws --profile {} glacier {} --account-id - --vault-name {} --output json'.format(self.aws_profile, cmd, self.vault_name)
         self.log('Glacier: ' + _cmd)
         
         if self.debug:
             return {'uploadId': '12345'}
 
-        n = 0
-        while n < 10:
-            status, output = subprocess.getstatusoutput(_cmd)
-            if status == 0:
-                break
-            else:
-                if 'RequestTimeoutException' in output:
-                    self.log('Glacier: AWS timeout, repeat command.')
-                    continue
-                else:
-                    raise AWSCLIError(output)
-        else:
-            raise AWSCLITimeoutError(output + '\nToo many timeouts: {}'.format(n))
+        status, output = subprocess.getstatusoutput(_cmd)
+        if status != 0:
+            raise AWSCLIError('AWS CLI error: ' + output)
 
         if len(output) > 0:
             return json.loads(output)
@@ -317,8 +382,6 @@ class Glacier:
 
         """
 
-        import shlex
-        
         assert isinstance(chunks, list)
         assert all([isinstance(chunk, str) for chunk in chunks])
         assert isinstance(chunk_size, int)
@@ -329,11 +392,8 @@ class Glacier:
             metadata = self._upload_multipart_archive(chunks, chunk_size, description)
         else:
             cs = self.checksum(chunks)[0]
-            cmd = ('upload-archive'
-                   ' --archive-description={}'
-                   ' --body={}'
-                   ' --checksum={}'
-            ).format(shlex.quote(description), chunks[0], cs)
+            cmd = 'upload-archive --body {} --checksum {}'.format(
+                chunks[0], cs)
             metadata = self.send(cmd)
 
         return metadata
@@ -346,8 +406,8 @@ class Glacier:
         # initiate upload
         cmd = (
             'initiate-multipart-upload'
-            ' --archive-description={}'
-            ' --part-size={}'
+            ' --archive-description {}'
+            ' --part-size {}'
         ).format(shlex.quote(description), chunk_size)
         multipart = self.send(cmd)
 
@@ -362,19 +422,19 @@ class Glacier:
             final_byte = min(next_byte + chunk_size - 1, file_size - 1)
             cmd = (
                 'upload-multipart-part'
-                ' --upload-id={}'
-                ' --body={}'
-                ' --range="bytes {}-{}/*"'
-                ' --checksum={}'
-            ).format(shlex.quote(multipart['uploadId']), chunks[i],
+                ' --upload-id {}'
+                ' --body {}'
+                ' --range "bytes {}-{}/*"'
+                ' --checksum {}'
+            ).format(multipart['uploadId'], chunks[i],
                      next_byte, final_byte, chunk_hashes[i])
 
             try:
                 self.send(cmd)
             except:
                 # something went wrong, abort the upload
-                cmd = 'abort-multipart-upload --upload-id={}'.format(
-                    shlex.quote(multipart['uploadId']))
+                cmd = 'abort-multipart-upload --upload-id {}'.format(
+                    multipart['uploadId'])
                 self.send(cmd)
                 raise
 
@@ -382,10 +442,10 @@ class Glacier:
             
         cmd = (
             'complete-multipart-upload'
-            ' --upload-id={}'
-            ' --checksum={}'
-            ' --archive-size={}'
-        ).format(shlex.quote(multipart['uploadId']), file_hash, file_size)
+            ' --upload-id {}'
+            ' --checksum {}'
+            ' --archive-size {}'
+        ).format(multipart['uploadId'], file_hash, file_size)
 
         return self.send(cmd)
 
@@ -399,7 +459,7 @@ class Glacier:
 
         """
 
-        cmd = 'delete-archive --archive-id={}'.format(archiveId)
+        cmd = 'delete-archive --archive-id {}'.format(archiveId)
         self.send(cmd)
 
 class Archiver:
@@ -413,11 +473,11 @@ class Archiver:
       The activity logger.
     backupdb : BackupDB
       The backup database.
-    backup_cache : string, optional
+    cache_dir : string, optional
       The backup cache location.
     tar_options : list, optional
       A list of options to include in the tar command.
-    gpg_key : string, optional
+    gpg_key_name : string, optional
       The name of the GPG key to use to encrypt the archive.
     min_age : int, optional
       The minimum Glacier archive age.  If the uploaded age is less
@@ -425,39 +485,34 @@ class Archiver:
       archive will not be created.
     debug : bool, optional
       Do everything but interact with Glacier.
-    cleanup : bool, optional
-      After uploading archive, clean up the cache directory.
     
     """
     
-    def __init__(self, chunk_size, log, backupdb,
-                 backup_cache=config.backup_cache,
-                 tar_options=config.tar_options, gpg_key=config.gpg_key,
-                 min_age=config.min_age, aws_profile=config.aws_profile,
-                 vault_name=config.vault_name, debug=False, cleanup=True):
+    def __init__(self, chunk_size, log, backupdb, cache_dir=config['cache_dir'],
+                 tar_options=config['tar_options'],
+                 gpg_key_name=config['gpg_key_name'], min_age=config['min_age'],
+                 aws_profile=config['aws_profile'],
+                 vault_name=config['vault_name'], debug=False):
         assert isinstance(chunk_size, int)
         assert isinstance(log, Logger)
         assert isinstance(backupdb, BackupDB)
-        assert isinstance(backup_cache, str)
+        assert isinstance(cache_dir, str)
         assert isinstance(tar_options, list)
-        assert isinstance(gpg_key, str)
+        assert isinstance(gpg_key_name, str)
         assert isinstance(aws_profile, str)
         assert isinstance(vault_name, str)
         assert isinstance(min_age, int)
-        assert isinstance(debug, bool)
-        assert isinstance(cleanup, bool)
         
         self.chunk_size = chunk_size
         self.log = log
         self.backupdb = backupdb
-        self.backup_cache = backup_cache
+        self.cache_dir = cache_dir
         self.tar_options = tar_options
-        self.gpg_key = gpg_key
+        self.gpg_key_name = gpg_key_name
         self.min_age = min_age
         self.aws_profile = aws_profile
         self.vault_name = vault_name
         self.debug = debug
-        self.cleanup = cleanup
 
         if self.debug:
             self.log("Archiver: Debug mode.")
@@ -467,7 +522,7 @@ class Archiver:
         import shlex
         head, tail = os.path.split(directory)
         tail = tail.replace(' ', '_')
-        cache = shlex.quote(self.backup_cache + tail)
+        cache = shlex.quote(self.cache_dir + tail)
         for chunk in chunks:
             os.remove(chunk)
         os.system('rmdir {}'.format(cache))
@@ -497,7 +552,7 @@ class Archiver:
         if dt is None:
             self.log('Archiver: Directory not in backup database.')
         elif dt <= self.min_age:
-            raise BackupTooYoung("Age = {} days".format(dt))
+            raise BackupTooYoung("Backup too young: age = {} days".format(dt))
 
         if dt is not None:
             # remember the last archiveId so that we can remove it after upload
@@ -521,9 +576,7 @@ class Archiver:
         if not self.debug:
             self.backupdb.update('last backup', directory, date)
             self.backupdb.update('glacier metadata', directory, metadata)
-
-        if self.cleanup:
-            self._clean_cache(directory, chunks)
+        self._clean_cache(directory, chunks)
 
     def _archive(self, directory):
         """Create an encrypted archive of a directory, split into chunks.
@@ -557,13 +610,13 @@ class Archiver:
 
         head, tail = os.path.split(directory)
         tail = tail.replace(' ', '_')
-        cache = shlex.quote(self.backup_cache + tail)
+        cache = shlex.quote(self.cache_dir + tail)
 
         self.log('Archiver: Using {} for cache location.'.format(cache))
 
         # check that path is clean
         if os.path.exists(cache):
-            raise CacheLocationExists("Remove before executing: {}".format(cache))
+            raise CacheLocationExists("Cache location exists, remove before executing: {}".format(cache))
 
         now = datetime.now()
         description = "directory:{} date:{}".format(directory, now.isoformat())
@@ -577,7 +630,7 @@ class Archiver:
         self.log('Archiver: ' + ' '.join(cmd))
         tar = Popen(cmd, stdout=PIPE, stderr=PIPE)
 
-        cmd = ['gpg', '-e', '-r', self.gpg_key]
+        cmd = ['gpg', '-e', '-r', self.gpg_key_name]
         self.log('Archiver: ' + ' '.join(cmd))
         gpg = Popen(cmd, stdin=tar.stdout, stdout=PIPE, stderr=PIPE)
 
@@ -585,11 +638,15 @@ class Archiver:
         self.log('Archiver: ' + ' '.join(cmd))
         split = Popen(cmd, stdin=gpg.stdout, stderr=PIPE)
 
-        status = 0
         output = []
         for prog in (tar, gpg, split):
-            status = prog.wait()
-            output.append(prog.stderr.read(-1))
+            r = prog.communicate()
+            if r[1] is not None:
+                output.append(r[1].decode())
+
+        status = 0
+        for prog in (tar, gpg, split):
+            status += prog.returncode
 
         self.log('Archiver:')
         if status != 0:
@@ -612,7 +669,6 @@ parser.add_argument('-b', default=128, type=int, help='Chunk size for archive up
 parser.add_argument('--db', action='store_true', help='Show the database contents.')
 parser.add_argument('--log', action='store_true', help='Show the backup log.')
 parser.add_argument('--debug', action='store_true', help='Do not send anything to AWS, no backup database updates.')
-parser.add_argument('--no-cleanup', dest='cleanup', action='store_false', help='Do not clean up the cache location.  Useful with --debug for verifying archive creation.')
 parser.add_argument('--checksum', action='store_true', help='Print the SHA256 tree checksum of the given file.')
 
 args = parser.parse_args()
@@ -622,7 +678,7 @@ if args.db:
     BackupDB().summary()
     exit(0)
 elif args.log:
-    with open('{}/backup.log'.format(config.backup_cache), 'r') as inf:
+    with open('{}/backup.log'.format(config['cache_dir']), 'r') as inf:
         print(inf.read(-1))
     exit(0)
     
@@ -637,8 +693,7 @@ if args.checksum:
 
 log = Logger()
 backupdb = BackupDB(log)
-archiver = Archiver(args.b * 1024**2, log, backupdb, debug=args.debug,
-                    cleanup=args.cleanup)
+archiver = Archiver(args.b * 1024**2, log, backupdb, debug=args.debug)
 
 try:
     archiver.backup(args.directory_or_file)
