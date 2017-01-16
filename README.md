@@ -28,7 +28,7 @@ This tool has not been extensively tested.  I hope you find `glacier-backup` use
 * Amazon's [AWS command-line interface](https://aws.amazon.com/cli/) set up with a defined profile.
 * A functioning [AWS Glacier](https://aws.amazon.com/glacier/) vault.
 * GnuPG set up with your prefered key for encryption.
-* The code is developed on a GNU/Linux system, so there may be a few places where adaptations are needed for other systems.
+* A GNU/Linux system: adaptations can probably be made for other systems.
 
 ## Examples
 Edit the config section at the top of the file before using.

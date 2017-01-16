@@ -3,26 +3,70 @@ import os
 import sys
 import argparse
 import configparser
+import logging
+import logging.handlers
 
+class CacheLocationExists(Exception):
+    pass
+
+class BackupTooYoung(Exception):
+    pass
+
+class TarGPGSplitError(Exception):
+    pass
+
+class AWSCLIError(Exception):
+    pass
+
+######################################################################
+logger = logging.getLogger('glacier-backup')
+logger.setLevel(logging.INFO)
+# Jan 15 07:36:04 corc rsyslogd: [origin software="rsyslogd" swVersion="8.16.0" x-pid="822" x-info="http://www.rsyslog.com"] rsyslogd was HUPed
+formatter = logging.Formatter('%(name)s: %(message)s')
+
+console = logging.StreamHandler()
+console.setLevel(logging.DEBUG)
+console.setFormatter(formatter)
+logger.addHandler(console)
+
+syslog = logging.handlers.SysLogHandler(address='/dev/log')
+syslog.setLevel(logging.INFO)
+syslog.setFormatter(formatter)
+logger.addHandler(syslog)
+
+######################################################################
+parser = argparse.ArgumentParser(description='Home backup to Amazon Glacier.')
+parser.add_argument('directory_or_file', nargs='?', default=None, help='Directory to be backed up, or file name for --checksum.')
+parser.add_argument('-b', default=128, type=int, help='Chunk size for archive uploading in mebibytes (MiB).')
+parser.add_argument('--config', action='store_true', help='Configure Glacier.')
+parser.add_argument('--db', action='store_true', help='Show the database contents.')
+parser.add_argument('--debug', action='store_true', help='Do not send anything to AWS, no backup database updates.')
+parser.add_argument('--checksum', action='store_true', help='Print the SHA256 tree checksum of the given file.')
+
+args = parser.parse_args()
+assert isinstance(args.b, int)
+
+######################################################################
 class Config:
     defaults = {
         'cache_dir': '/var/backup/glacier-cache/',
         'min_age': 90,
         'tar_options': '-p --ignore-failed-read --exclude-tag=NOBACKUP',
-        'gpg_key_name': 'recipient',
-        'vault_name': 'vault',
-        'aws_profile': 'default'
+        'gpg_key_name': '',
+        'vault_name': '',
+        'aws_profile': ''
     }
     descriptions = {
         'cache_dir': 'Cache directory',
         'min_age': 'Minimum archive age in days',
         'tar_options': 'tar command options',
-        'gpg_key_name': 'GPG key name (gpg -r parameter)',
+        'gpg_key_name': 'GPG key name',
         'vault_name': 'Glacier vault name',
         'aws_profile': 'AWS CLI profile name'
     }
 
     def __init__(self):
+        self.logger = logging.getLogger('glacier-backup.Config')
         self.config_file = os.path.join(os.path.expanduser("~"),
                                         '.config', 'glacier-backup',
                                         'config.ini')
@@ -31,7 +75,8 @@ class Config:
             self[k] = v
 
         if not os.path.exists(self.config_file):
-            sys.stderr.write('Configuration file not found.  Generating default file: {}\n'.format(self.config_file))
+            logger.error('Configuration file not found.  Generating default file: {}'.format(self.config_file))
+            logger.error('Edit configuration file, or run {} with --config option.'.format(sys.argv[0]))
 
             path = os.path.dirname(self.config_file)
             d = path.split(os.path.sep)
@@ -43,12 +88,16 @@ class Config:
                     os.mkdir(x)
 
             self.save()
+            exit(1)
         else:
             self.load()
 
     def __setitem__(self, k, v):
+        import subprocess
+        
         if k not in self.defaults.keys():
             raise KeyError('Invalid config key name: {}'.format(k))
+        
         if k == 'tar_options':
             if isinstance(v, list):
                 assert all([isinstance(s, str) for s in v]), 'Each tar_options item must be a string.'
@@ -70,14 +119,18 @@ class Config:
             return self._config[k]
 
     def _prompt(self, request, default):
-        print('{} [{}]: '.format(request, default), end=' ')
-        answer = sys.readline().strip()
+        print('{} [{}]: '.format(request, default), end=' ', flush=True)
+        answer = sys.stdin.readline().strip()
         answer = default if len(answer) == 0 else answer
         return answer
 
     def configure(self):
-        for k, v in self._config.items():
-            self[k] = self._prompt(self.descriptions[k], v)
+        for k, v in sorted(self._config.items()):
+            if k == 'tar_options':
+                self[k] = self._prompt(self.descriptions[k], ' '.join(v))
+            else:
+                self[k] = self._prompt(self.descriptions[k], v)
+        self.save()
 
     def save(self):
         c = configparser.ConfigParser()
@@ -93,50 +146,11 @@ class Config:
             self[k] = c['default'][k]
 
 config = Config()
+if args.config:
+    config.configure()
+    exit(0)
 
-class CacheLocationExists(Exception):
-    pass
-
-class BackupTooYoung(Exception):
-    pass
-
-class TarGPGSplitError(Exception):
-    pass
-
-class AWSCLIError(Exception):
-    pass
-
-class Logger:
-    """Activity and error logger.
-
-    Parameters
-    ----------
-    cache_dir : string, optional
-      The name of the directory in which to write the log.
-
-    """
-    
-    def __init__(self, cache_dir=config['cache_dir']):
-        import logging
-        assert isinstance(cache_dir, str)
-        self.filename = '{}/backup.log'.format(cache_dir)
-        logging.basicConfig(filename=self.filename, format='%(message)s',
-                            level=logging.INFO)
-
-        self('\n' + '=' * 72)
-        self.timestamp()
-        self('glacier-backup.py {}'.format(' '.join(sys.argv[1:])))
-
-    def __call__(self, message):
-        import logging
-        print(message)
-        logging.info(message)
-
-    def timestamp(self):
-        import logging
-        from datetime import datetime
-        logging.info('{}'.format(datetime.now().isoformat()))
-
+######################################################################
 class BackupDB:
     """Backup database IO.
 
@@ -144,8 +158,6 @@ class BackupDB:
 
     Parameters
     ----------
-    log : Logger, optional
-      The activity logger, or `None` for no logging.
     backupdb : string, optional
       The location and name of the backup database file.
 
@@ -153,14 +165,14 @@ class BackupDB:
 
     backup_parameters = ('last backup', 'glacier metadata')
     
-    def __init__(self, log=None, backupdb=config['backupdb']):
-        assert isinstance(log, (Logger, type(None)))
+    def __init__(self, backupdb=config['backupdb']):
         assert isinstance(backupdb, str)
-        self._log = log
         self.backupdb = backupdb
         
+        self.logger = logging.getLogger('glacier-backup.BackupDB')
+
         if not os.path.exists(self.backupdb):
-            self.log("Creating empty backup database.")
+            self.logger.info("Creating empty backup database.")
 
             db = {}
             for k in self.backup_parameters:
@@ -168,12 +180,6 @@ class BackupDB:
 
             self.save(db)
     
-    def log(self, msg):
-        if self._log is not None:
-            self._log(msg)
-        else:
-            print(msg)
-
     def save(self, db):
         """Overwrite backup database file with `db`."""
         import pickle
@@ -217,7 +223,7 @@ class BackupDB:
         assert isinstance(directory, str)
         db[parameter][directory] = data
         self.save(db)
-        self.log('Updated database [{}]:\n  {}: {}'.format(
+        self.logger.info('Updated database [{}]:\n  {}: {}'.format(
             parameter, directory, str(data)))
 
     def summary(self):
@@ -230,8 +236,6 @@ class Glacier:
 
     Parameters
     ----------
-    log : Logger, optional
-      Activity logger.
     aws_profile : string, optional
       The name of the AWS CLI profile to use.
     vault_name : string, optional
@@ -242,26 +246,20 @@ class Glacier:
 
     """
 
-    def __init__(self, log=None, aws_profile=config['aws_profile'],
+    def __init__(self, aws_profile=config['aws_profile'],
                  vault_name=config['vault_name'], debug=False):
-        assert isinstance(log, (Logger, type(None)))
         assert isinstance(aws_profile, str)
         assert isinstance(vault_name, str)
         assert isinstance(debug, bool)
 
-        self._log = log
+        self.logger = logging.getLogger('glacier-backup.Glacier')
+
         self.aws_profile = aws_profile
         self.vault_name = vault_name
         self.debug = debug
 
         if self.debug:
-            self.log('Glacier: Debug mode.  No AWS commands will be executed.')
-
-    def log(self, msg):
-        if self._log is not None:
-            self._log(msg)
-        else:
-            print(msg)
+            self.logger.info('Debug mode.  No AWS commands will be executed.')
 
     def send(self, cmd):
         """Send Glacier command to AWS.
@@ -287,7 +285,7 @@ class Glacier:
         import subprocess
 
         _cmd = 'aws --profile {} glacier {} --account-id - --vault-name {} --output json'.format(self.aws_profile, cmd, self.vault_name)
-        self.log('Glacier: ' + _cmd)
+        self.logger.info(_cmd)
         
         if self.debug:
             return {'uploadId': '12345'}
@@ -414,7 +412,7 @@ class Glacier:
         file_size = 0
         for chunk in chunks:
             file_size += os.stat(chunk).st_size
-        self.log('Glacier: Total archive size: {}'.format(file_size))
+        self.logger.info('Total archive size: {}'.format(file_size))
 
         # loop through chunks, keeping track of combined file byte position
         next_byte = 0
@@ -469,8 +467,6 @@ class Archiver:
     ----------
     chunk_size : int
       The file chunk size.
-    log : Logger
-      The activity logger.
     backupdb : BackupDB
       The backup database.
     cache_dir : string, optional
@@ -488,13 +484,12 @@ class Archiver:
     
     """
     
-    def __init__(self, chunk_size, log, backupdb, cache_dir=config['cache_dir'],
+    def __init__(self, chunk_size, backupdb, cache_dir=config['cache_dir'],
                  tar_options=config['tar_options'],
                  gpg_key_name=config['gpg_key_name'], min_age=config['min_age'],
                  aws_profile=config['aws_profile'],
                  vault_name=config['vault_name'], debug=False):
         assert isinstance(chunk_size, int)
-        assert isinstance(log, Logger)
         assert isinstance(backupdb, BackupDB)
         assert isinstance(cache_dir, str)
         assert isinstance(tar_options, list)
@@ -504,7 +499,6 @@ class Archiver:
         assert isinstance(min_age, int)
         
         self.chunk_size = chunk_size
-        self.log = log
         self.backupdb = backupdb
         self.cache_dir = cache_dir
         self.tar_options = tar_options
@@ -514,8 +508,10 @@ class Archiver:
         self.vault_name = vault_name
         self.debug = debug
 
+        self.logger = logging.getLogger('glacier-backup.Archiver')
+        
         if self.debug:
-            self.log("Archiver: Debug mode.")
+            self.logger.info("Debug mode.")
 
     def _clean_cache(self, directory, chunks):
         """Clean the cache for `directory`."""
@@ -526,7 +522,7 @@ class Archiver:
         for chunk in chunks:
             os.remove(chunk)
         os.system('rmdir {}'.format(cache))
-        self.log('Cleaned cache.\n')
+        self.logger.info('Cleaned cache.')
 
     def backup(self, directory):
         """Tar, encrypt, and split a directory, and upload to Glacier.
@@ -546,11 +542,11 @@ class Archiver:
         assert os.path.isdir(directory)
 
         directory = os.path.normpath(directory)
-        self.log("Archiver: Archiving {}".format(directory))
+        self.logger.info("Archiving {}".format(directory))
 
         dt = self.backupdb.last_backup_age(directory)
         if dt is None:
-            self.log('Archiver: Directory not in backup database.')
+            self.logger.warning('Directory not in backup database.')
         elif dt <= self.min_age:
             raise BackupTooYoung("Backup too young: age = {} days".format(dt))
 
@@ -560,19 +556,14 @@ class Archiver:
         else:
             last_archiveId = None
 
-        self.log('')
-        self.log.timestamp()
         chunks, description, date = self._archive(directory)
 
-        self.log.timestamp()
-        glacier = Glacier(self.log, aws_profile=self.aws_profile,
+        glacier = Glacier(aws_profile=self.aws_profile,
                           vault_name=self.vault_name, debug=self.debug)
         metadata = glacier.upload_archive(chunks, self.chunk_size, description)
         if last_archiveId is not None:
             glacier.remove_archive(last_archiveId)
 
-        self.log('')
-        self.log.timestamp()
         if not self.debug:
             self.backupdb.update('last backup', directory, date)
             self.backupdb.update('glacier metadata', directory, metadata)
@@ -612,7 +603,7 @@ class Archiver:
         tail = tail.replace(' ', '_')
         cache = shlex.quote(self.cache_dir + tail)
 
-        self.log('Archiver: Using {} for cache location.'.format(cache))
+        self.logger.info('Using {} for cache location.'.format(cache))
 
         # check that path is clean
         if os.path.exists(cache):
@@ -620,22 +611,22 @@ class Archiver:
 
         now = datetime.now()
         description = "directory:{} date:{}".format(directory, now.isoformat())
-        self.log('Archiver: ' + description)
+        self.logger.info(description)
 
         # create tar, encrypt, and split into chunks
         os.system('mkdir {}'.format(cache))
         prefix = '{}/archive-'.format(cache)
 
         cmd = ['tar'] + self.tar_options + ['-c', directory]
-        self.log('Archiver: ' + ' '.join(cmd))
+        self.logger.info(' '.join(cmd))
         tar = Popen(cmd, stdout=PIPE, stderr=PIPE)
 
         cmd = ['gpg', '-e', '-r', self.gpg_key_name]
-        self.log('Archiver: ' + ' '.join(cmd))
+        self.logger.info(' '.join(cmd))
         gpg = Popen(cmd, stdin=tar.stdout, stdout=PIPE, stderr=PIPE)
 
         cmd = ['split', '-a3', '-b{}'.format(self.chunk_size), '-', prefix]
-        self.log('Archiver: ' + ' '.join(cmd))
+        self.logger.info(' '.join(cmd))
         split = Popen(cmd, stdin=gpg.stdout, stderr=PIPE)
 
         output = []
@@ -648,40 +639,20 @@ class Archiver:
         for prog in (tar, gpg, split):
             status += prog.returncode
 
-        self.log('Archiver:')
         if status != 0:
             output.insert(0, 'Error creating archive with tar/gpg/split.')
             raise TarGPGSplitError('\n'.join(output))
 
-        self.log('Archiver:')
-        self.log(subprocess.check_output(['ls', '-l', cache]).decode())
+        self.logger.info(subprocess.check_output(['ls', '-l', cache]).decode())
 
         status, ls = subprocess.getstatusoutput('ls {}???'.format(prefix))
         if status != 0:
             raise TarGPGSplitError('No archive created.  Verify directory and read permissions.')
         chunks = ls.split()
-        self.log("Archiver: {} chunks".format(len(chunks)))
+        self.logger.info("{} chunks".format(len(chunks)))
         return chunks, description, now
-
-parser = argparse.ArgumentParser(description='Home backup to Amazon Glacier.')
-parser.add_argument('directory_or_file', nargs='?', default=None, help='Directory to be backed up, or file name for --checksum.')
-parser.add_argument('-b', default=128, type=int, help='Chunk size for archive uploading in mebibytes (MiB).')
-parser.add_argument('--db', action='store_true', help='Show the database contents.')
-parser.add_argument('--log', action='store_true', help='Show the backup log.')
-parser.add_argument('--debug', action='store_true', help='Do not send anything to AWS, no backup database updates.')
-parser.add_argument('--checksum', action='store_true', help='Print the SHA256 tree checksum of the given file.')
-
-args = parser.parse_args()
-assert isinstance(args.b, int)
-
-if args.db:
-    BackupDB().summary()
-    exit(0)
-elif args.log:
-    with open('{}/backup.log'.format(config['cache_dir']), 'r') as inf:
-        print(inf.read(-1))
-    exit(0)
     
+######################################################################
 if args.directory_or_file is None:
     parser.error('Directory (or file for --checksum) is requried.')
     exit(1)
@@ -691,20 +662,19 @@ if args.checksum:
     print(Glacier().checksum([args.directory_or_file])[0])
     exit(0)
 
-log = Logger()
-backupdb = BackupDB(log)
-archiver = Archiver(args.b * 1024**2, log, backupdb, debug=args.debug)
+logger.info('glacier-backup.py {}'.format(' '.join(sys.argv[1:])))
+backupdb = BackupDB()
+archiver = Archiver(args.b * 1024**2, backupdb, debug=args.debug)
 
 try:
     archiver.backup(args.directory_or_file)
     status = 0
 except:
     e = sys.exc_info()
-    log('\n{}: {}'.format(e[0].__name__, str(e[1])))
+    logger.error('\n{}: {}'.format(e[0].__name__, str(e[1])))
     status = 1
     if args.debug:
         import traceback
-        traceback.print_exc()
+        logger.debug(traceback.format_exc())
     
-log.timestamp()
 exit(status)
