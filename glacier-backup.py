@@ -593,10 +593,12 @@ class Archiver:
 
         """
 
+        import io
         import shlex
         import tarfile
         import subprocess
         from subprocess import Popen, PIPE
+        from threading import Thread
         from datetime import datetime    
 
         head, tail = os.path.split(directory)
@@ -617,33 +619,58 @@ class Archiver:
         os.system('mkdir {}'.format(cache))
         prefix = '{}/archive-'.format(cache)
 
+        def move_data(input, output):
+            buffer_size = 1024
+            last_read = buffer_size
+            while last_read == buffer_size:
+                data = input.read(buffer_size)
+                output.write(data)
+                last_read = len(data)
+
+        output = io.BytesIO()
+        threads = []
+
         cmd = ['tar'] + self.tar_options + ['-c', directory]
         self.logger.info(' '.join(cmd))
         tar = Popen(cmd, stdout=PIPE, stderr=PIPE)
 
         cmd = ['gpg', '-e', '-r', self.gpg_key_name]
         self.logger.info(' '.join(cmd))
-        gpg = Popen(cmd, stdin=tar.stdout, stdout=PIPE, stderr=PIPE)
+        gpg = Popen(cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE)
 
         cmd = ['split', '-a3', '-b{}'.format(self.chunk_size), '-', prefix]
         self.logger.info(' '.join(cmd))
-        split = Popen(cmd, stdin=gpg.stdout, stderr=PIPE)
+        split = Popen(cmd, stdin=PIPE, stderr=PIPE)
 
-        output = []
-        for prog in (tar, gpg, split):
-            r = prog.communicate()
-            if r[1] is not None:
-                output.append(r[1].decode())
+        threads.append(Thread(target=move_data, args=(tar.stdout, gpg.stdin)))
+        threads.append(Thread(target=move_data, args=(tar.stderr, output)))
+        threads.append(Thread(target=move_data, args=(gpg.stdout, split.stdin)))
+        threads.append(Thread(target=move_data, args=(gpg.stderr, output)))
+        threads.append(Thread(target=move_data, args=(split.stderr, output)))
+        for t in threads:
+            t.start()
 
-        status = 0
-        for prog in (tar, gpg, split):
-            status += prog.returncode
+        for t in threads[:2]:
+            t.join()
 
-        if status != 0:
-            output.insert(0, 'Error creating archive with tar/gpg/split.')
-            raise TarGPGSplitError('\n'.join(output))
+        tar.wait()
+        gpg.stdin.close()
+        for t in threads[2:4]:
+            t.join()
 
-        self.logger.info(subprocess.check_output(['ls', '-l', cache]).decode())
+        gpg.wait()
+        split.stdin.close()
+        threads[4].join()
+        split.wait()
+        
+        output.seek(0)
+        self.logger.info(output.read().decode())
+
+        for p in (tar, gpg, split):
+            if p.returncode != 0:
+                print(p.returncode, flush=True)
+                self.logger.error('Error creating archive with tar/gpg/split.')
+                raise TarGPGSplitError
 
         status, ls = subprocess.getstatusoutput('ls {}???'.format(prefix))
         if status != 0:
@@ -663,6 +690,7 @@ if args.checksum:
     exit(0)
 
 logger.info('Command line parameters: {}'.format(' '.join(sys.argv[1:])))
+os.nice(20)
 backupdb = BackupDB()
 archiver = Archiver(args.b * 1024**2, backupdb, debug=args.debug)
 
