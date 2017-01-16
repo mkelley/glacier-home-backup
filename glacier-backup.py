@@ -662,7 +662,7 @@ if args.checksum:
     print(Glacier().checksum([args.directory_or_file])[0])
     exit(0)
 
-logger.info('glacier-backup.py {}'.format(' '.join(sys.argv[1:])))
+logger.info('Command line parameters: {}'.format(' '.join(sys.argv[1:])))
 backupdb = BackupDB()
 archiver = Archiver(args.b * 1024**2, backupdb, debug=args.debug)
 
