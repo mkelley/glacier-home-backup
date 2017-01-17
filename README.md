@@ -1,8 +1,8 @@
 # Glacier backup
 Backup home data to Amazon's Glacier.
 
-    usage: glacier-backup.py [-h] [-b B] [--config] [--db] [--debug] [--checksum]
-                             [directory_or_file]
+    usage: glacier-backup.py [-h] [-b B] [--configure] [--db] [--debug]
+                             [--checksum] [directory_or_file]
     
     Home backup to Amazon Glacier.
     
@@ -12,7 +12,7 @@ Backup home data to Amazon's Glacier.
     optional arguments:
       -h, --help         show this help message and exit
       -b B               Chunk size for archive uploading in mebibytes (MiB).
-      --config           Configure glacier-backup.
+      --configure        Configure glacier-backup.
       --db               Show the database contents.
       --debug            Do not send anything to AWS, no backup database updates.
       --checksum         Print the SHA256 tree checksum of the given file.
@@ -31,8 +31,6 @@ This tool has not been extensively tested.  I hope you find `glacier-backup` use
 * A GNU/Linux system: adaptations can probably be made for other systems.
 
 ## Examples
-Edit the config section at the top of the file before using.
-
 Backup a directory, uploading 8 MiB chunks at a time to Glacier:
 
     $ glacier-backup.py -b8 /var/backup/notwo/disks/data0/documents/alaska

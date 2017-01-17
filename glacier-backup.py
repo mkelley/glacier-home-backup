@@ -38,7 +38,7 @@ logger.addHandler(syslog)
 parser = argparse.ArgumentParser(description='Home backup to Amazon Glacier.')
 parser.add_argument('directory_or_file', nargs='?', default=None, help='Directory to be backed up, or file name for --checksum.')
 parser.add_argument('-b', default=128, type=int, help='Chunk size for archive uploading in mebibytes (MiB).')
-parser.add_argument('--config', action='store_true', help='Configure glacier-backup.')
+parser.add_argument('--configure', action='store_true', help='Configure glacier-backup.')
 parser.add_argument('--db', action='store_true', help='Show the database contents.')
 parser.add_argument('--debug', action='store_true', help='Do not send anything to AWS, no backup database updates.')
 parser.add_argument('--checksum', action='store_true', help='Print the SHA256 tree checksum of the given file.')
@@ -76,7 +76,7 @@ class Config:
 
         if not os.path.exists(self.config_file):
             logger.error('Configuration file not found.  Generating default file: {}'.format(self.config_file))
-            logger.error('Edit configuration file, or run {} with --config option.'.format(sys.argv[0]))
+            logger.error('Edit configuration file, or run {} with --configure option.'.format(sys.argv[0]))
 
             path = os.path.dirname(self.config_file)
             d = path.split(os.path.sep)
@@ -146,7 +146,7 @@ class Config:
             self[k] = c['default'][k]
 
 config = Config()
-if args.config:
+if args.configure:
     config.configure()
     exit(0)
 
@@ -680,6 +680,10 @@ class Archiver:
         return chunks, description, now
     
 ######################################################################
+if args.db:
+    BackupDB().summary()
+    exit(0)
+
 if args.directory_or_file is None:
     parser.error('Directory (or file for --checksum) is requried.')
     exit(1)
