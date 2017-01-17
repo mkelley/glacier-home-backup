@@ -51,7 +51,7 @@ class Config:
     defaults = {
         'cache_dir': '/var/backup/glacier-cache/',
         'min_age': 90,
-        'tar_options': '-p --ignore-failed-read --exclude-tag=NOBACKUP',
+        'tar_options': '-p --ignore-failed-read --exclude-tag=NOGLACIERBACKUP',
         'gpg_key_name': '',
         'vault_name': '',
         'aws_profile': ''
